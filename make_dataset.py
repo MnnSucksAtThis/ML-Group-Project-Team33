@@ -16,41 +16,24 @@ PIPELINE (one loop iteration = one "load-flow snapshot"):
     4. corrupt the true injections with forecast err -> "pseudo-measurements" (used by physics loss)
     5. apply a dropout mask                          -> some PMU channels become unavailable
 
-Run:   python make_dataset.py --out data
+Run:   python make_dataset.py --out data   (IEEE 33-bus only)
 Quick: python make_dataset.py --n_train 300 --n_val 100 --n_test 100 --out data_small
 """
 import argparse
 import os
-import urllib.request
 
 import numpy as np
 import pandapower as pp
 import pandapower.networks as pn
 
 
-
-
 # ----------------------------------------------------------------------------------
 # 1. BUILD THE NETWORKS
 # ----------------------------------------------------------------------------------
-def _read_matrix(text, name):
-    """Extract the numeric block  `mpc.<name> = [ ... ];`  from a MATPOWER .m file."""
-    start = text.index(f"mpc.{name} = [")
-    end = text.index("];", start)
-    rows = []
-    for line in text[start:end].splitlines()[1:]:       # skip the 'mpc.xxx = [' line
-        line = line.split("%")[0].replace(";", " ").strip()   # strip MATLAB comments / ';'
-        if line:
-            rows.append([float(v) for v in line.split()])
-    return np.array(rows)
-
-
-
-
-
-def build_net(system, case69_path=None):
+def build_net(system):
     if system == "ieee33":
         return pn.case33bw()               # Baran-Wu 33-bus, built into pandapower
+    raise ValueError(system)
 
 
 # ----------------------------------------------------------------------------------
@@ -86,6 +69,7 @@ def simulate_snapshots(net, n, rng, p0, q0):
     hour = np.zeros(n)
     nl = len(net.load)
     k = 0
+    fails = 0
     while k < n:
         h = rng.uniform(0, 24)                                       # time of day
         day = np.clip(rng.normal(1.0, 0.05), 0.85, 1.15)             # day-to-day variation
@@ -96,6 +80,9 @@ def simulate_snapshots(net, n, rng, p0, q0):
         try:
             pp.runpp(net, calculate_voltage_angles=True)             # <-- AC power flow
         except pp.LoadflowNotConverged:
+            fails += 1
+            if fails > 5 * n + 100:   # guard: never loop forever
+                raise RuntimeError("power flow keeps diverging - check load scaling")
             continue
         r = net.res_bus.loc[net.bus.index]
         vm[k] = r["vm_pu"].values
@@ -105,6 +92,8 @@ def simulate_snapshots(net, n, rng, p0, q0):
         qinj[k] = -r["q_mvar"].values / net.sn_mva
         hour[k] = h
         k += 1
+        if k % 500 == 0 or k == n:           # progress, so the run never looks frozen
+            print(f"    simulated {k}/{n} snapshots", flush=True)
     return dict(vm=vm, va=va, pinj=pinj, qinj=qinj, hour=hour)
 
 
@@ -176,21 +165,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data")
     ap.add_argument("--systems", nargs="+", default=["ieee33"])
-    ap.add_argument("--n_train", type=int, default=10)
-    ap.add_argument("--n_val", type=int, default=1)
-    ap.add_argument("--n_test", type=int, default=1)
+    ap.add_argument("--n_train", type=int, default=8000)
+    ap.add_argument("--n_val", type=int, default=1000)
+    ap.add_argument("--n_test", type=int, default=1000)
     ap.add_argument("--pmu_frac", type=float, default=0.5, help="fraction of non-slack buses that own a PMU")
     ap.add_argument("--sig_vm", type=float, default=0.001, help="PMU |V| noise std [pu]")
     ap.add_argument("--sig_va", type=float, default=0.05, help="PMU angle noise std [deg]")
     ap.add_argument("--sig_pseudo", type=float, default=0.10, help="load-forecast relative error std")
     ap.add_argument("--levels", nargs="+", type=float, default=[0.1, 0.2, 0.3, 0.4, 0.5])
-    ap.add_argument("--case69_path", default=None)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
     for system in a.systems:
         print(f"\n=== {system} ===")
-        net = build_net(system, a.case69_path)
+        net = build_net(system)
         nb = len(net.bus)
         slack = int(np.where(net.bus.index == net.ext_grid.bus.iloc[0])[0][0])
         p0, q0 = net.load["p_mw"].values.copy(), net.load["q_mvar"].values.copy()  # nominal loads
@@ -203,12 +191,14 @@ def main():
         pmu_idx = np.sort(place_rng.choice(cand, k, replace=False))
         print(f"buses={nb}  slack={slack}  PMUs={k} at buses {pmu_idx.tolist()}")
 
-        outdir = os.path.join(a.out, system)
+        outdir = os.path.abspath(os.path.join(a.out, system))
         os.makedirs(outdir, exist_ok=True)
+        print("writing to:", outdir, flush=True)
         # Independent RNG streams per split -> no snapshot is shared between train/val/test.
         rng = {s: np.random.default_rng(a.seed + 1000 * (i + 1)) for i, s in enumerate(["train", "val", "test"])}
 
         def sim_and_meas(split, n):
+            print(f"  [{split}] simulating...", flush=True)
             sim = simulate_snapshots(net, n, rng[split], p0, q0)
             meas = make_measurements(sim, pmu_idx, slack, rng[split], a.sig_vm, a.sig_va, a.sig_pseudo)
             return sim, meas
@@ -218,6 +208,7 @@ def main():
         print("physics check (max |S_calc - S_true|, pu):", f"{check_physics(Y, sim, slack):.2e}")
         np.savez_compressed(os.path.join(outdir, "train.npz"),
                             **pack(sim, meas, np.ones((a.n_train, k), np.float32), 0.0))
+        print("  saved train.npz", flush=True)
 
         # ---- VAL: dropout level drawn per snapshot from the list of levels ----
         sim, meas = sim_and_meas("val", a.n_val)
